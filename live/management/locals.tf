@@ -4,6 +4,7 @@ locals {
     Project     = var.name
     Environment = var.environment
     ManagedBy   = "Terraform"
+    Path        = "aws-control/live/management"
   }
 
   root_id             = data.aws_organizations_organization.this.roots[0].id

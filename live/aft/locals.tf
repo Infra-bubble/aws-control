@@ -4,5 +4,6 @@ locals {
     Project     = var.name
     Environment = var.environment
     ManagedBy   = "Terraform"
+    Path        = "aws-control/live/aft"
   }
 }

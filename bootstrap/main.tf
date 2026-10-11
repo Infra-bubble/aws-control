@@ -1,11 +1,9 @@
 resource "aws_s3_bucket" "tfstate" {
   bucket = "${local.resource_prefix}-tfstate-bucket"
 
-  tags = {
-    Name        = "${local.resource_prefix}-tfstate-bucket"
-    Environment = var.environment
-    ManagedBy   = "Terraform"
-  }
+  tags = merge(local.tags, {
+    Name = "${local.resource_prefix}-tfstate-bucket"
+  })
 }
 
 resource "aws_s3_bucket_versioning" "tfstate" {
