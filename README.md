@@ -10,12 +10,22 @@ Codifies the AWS Control Tower landing zone for Meridian Payments Ltd with Terra
 aws-control/
 ├── bootstrap/           # one-off: creates the S3 state bucket (local state)
 ├── live/
-│   └── management/      # root module: OUs + Control Tower registration
+│   ├── management/      # root module: OUs + Control Tower registration
+│   └── aft/             # root module: deploys AFT (aws-ia/control_tower_account_factory/aws)
 └── modules/
     └── ous/             # one OU + its Control Tower baseline
 ```
 
 Each folder under `live/` is a root module: run `terraform` from inside it. `modules/` are only ever called from a root module.
+
+AFT reads four more repos in the `Infra-bubble` GitHub org. You push to them, and AFT applies them:
+
+| Repo | Purpose |
+|---|---|
+| `aft-account-request` | Accounts to vend, and their tags |
+| `aft-global-customizations` | Terraform applied in every vended account (`platform-baseline` role) |
+| `aft-account-customizations` | Per-account Terraform, selected by `account_customizations_name` |
+| `aft-account-provisioning-customizations` | Step Functions hooks during provisioning (template default) |
 
 ## Target organization
 
@@ -37,6 +47,7 @@ Each folder under `live/` is a root module: run `terraform` from inside it. `mod
 | Audit | `783495713938` | Created by Control Tower |
 | Log Archive | `263953131739` | Created by Control Tower |
 | aft-management | `255291985306` | Hosts the AFT pipelines |
+| sandbox-nick | `810711873528` | First AFT-vended account (Sandbox OU) |
 
 Home region: `eu-west-2`. Governed regions: `eu-west-2`, `eu-west-1`, `eu-north-1`.
 
@@ -143,18 +154,107 @@ aws servicecatalog scan-provisioned-products \
 
 The account is created at the org root and moved into its OU partway through. Don't deploy AFT until it is `AVAILABLE` and shows as **Enrolled** in Control Tower.
 
-### 6. Deploy AFT — *next*
+### 6. Create the AFT repos
 
-- [ ] Request an Organizations account quota increase (currently 5, us-east-1 → Service Quotas)
-- [ ] Create the AFT repos in the `Infra-bubble` GitHub org from the [AFT templates](https://github.com/aws-ia/terraform-aws-control_tower_account_factory/tree/main/sources/aft-customizations-repos):
-  - `aft-account-request`
-  - `aft-global-customizations`
-  - `aft-account-customizations`
-  - `aft-account-provisioning-customizations`
-- [ ] `live/aft` root module calling `aws-ia/control_tower_account_factory/aws` (state key `aft/terraform.tfstate`, AFT VPC disabled)
-- [ ] Approve the GitHub connection in the AFT account (Developer Tools → Connections)
-- [ ] Global customization: baseline IAM role in every vended account
-- [ ] Vend a test account with `account_tags`, verify, then close it
+Created the four AFT repos as private, empty repos in `Infra-bubble`, then copied in the AWS templates:
+
+```bash
+git clone --depth 1 https://github.com/aws-ia/terraform-aws-control_tower_account_factory.git aft-upstream
+for r in aft-account-request aft-global-customizations aft-account-customizations aft-account-provisioning-customizations; do
+  git clone https://github.com/Infra-bubble/$r.git
+  cp -R aft-upstream/sources/aft-customizations-repos/$r/. $r/
+  (cd $r && git add -A && git commit -m "AFT template" && git push -u origin main)
+done
+```
+
+The AFT module itself is not cloned. `terraform init` downloads it from the Terraform Registry.
+
+### 7. Deploy AFT
+
+```bash
+cd live/aft
+terraform init
+terraform plan        # ~340 resources
+terraform apply
+```
+
+State: `s3://meridian-payments-ltd-management-tfstate-bucket/aft/terraform.tfstate`.
+
+- Runs with **management account** credentials. `live/aft` has no provider block, because the AFT module configures its own providers and assumes `AWSControlTowerExecution` into the AFT, Audit and Log Archive accounts.
+- Module pinned to `1.22.0`, `vcs_provider = "github"`, repos named `Infra-bubble/aft-*`.
+- `aft_enable_vpc = false` and `aft_vpc_endpoints = false` stop AFT creating a VPC, NAT gateways and endpoints, which is the main running cost.
+- What AFT creates: pipelines, CodeBuild, Lambdas, Step Functions, DynamoDB and SSM in the AFT account; `AWSAFTExecution` / `AWSAFTService` roles in the management, Audit and Log Archive accounts; an `aft-logging` bucket in Log Archive.
+
+The first apply can fail with `AccessDeniedException ... codebuild:StartBuild` from `aft-lambda-layer-codebuild-trigger`. That's IAM eventual consistency, where the Lambda runs before its new role policy has propagated. Run `terraform apply` again.
+
+### 8. Approve the GitHub connection
+
+AFT creates `ct-aft-github-connection` in the AFT account in **Pending** state, and its two pipelines fail with *"Connection ct-aft-github-connection is not available"* until it's approved.
+
+1. Sign in to the access portal (`https://d-9c67b48b57.awsapps.com/start`) → **aft-management** → **AWSAdministratorAccess**, region London.
+2. Open `https://eu-west-2.console.aws.amazon.com/codesuite/settings/connections?region=eu-west-2` (CodePipeline → Settings → Connections).
+3. Select `ct-aft-github-connection` → **Update pending connection** → authorise **AWS Connector for GitHub**, installed on the **Infra-bubble** org with access to the four `aft-*` repos.
+4. Status becomes **Available**. Re-run `ct-aft-account-provisioning-customizations` with **Release change** to confirm the Source stage succeeds.
+
+### 9. Vend an account
+
+Accounts are defined in `aft-account-request/terraform/locals.tf`. Each entry in `local.accounts` is one account:
+
+```hcl
+accounts = {
+  "sandbox-nick" = {
+    email          = "<name>+sandbox-nick@gmail.com"   # unique root email, never reused
+    ou             = "Sandbox"                         # nested OUs: "Prod (ou-xxxx-xxxxxxxx)"
+    environment    = "sandbox"
+    customizations = ""                                # folder in aft-account-customizations
+    reason         = "First AFT-vended account to test the pipeline"
+  }
+}
+```
+
+The global customization in `aft-global-customizations/terraform/main.tf` creates `platform-baseline` in every vended account: an IAM role with `ReadOnlyAccess` that the management account can assume.
+
+Push `aft-global-customizations` first, then `aft-account-request`. Every push to `aft-account-request` runs the request pipeline:
+
+| Change to `local.accounts` | Result |
+|---|---|
+| Add an entry | New account vended and customized |
+| Change tags / customizations | Existing account updated |
+| Remove an entry | AFT stops managing it; the account is **not** closed |
+
+What happens after a push (all in the AFT account), and how long `sandbox-nick` took:
+
+| Step | Where | Time |
+|---|---|---|
+| Request written to DynamoDB `aft-request` (keyed by account email) | CodePipeline `ct-aft-account-request` | ~1 min |
+| Stream → Lambda → SQS → processor (every 5 min) → Service Catalog | Lambda / SQS | ~1 min |
+| Account created and enrolled | Service Catalog (management account) | ~11 min |
+| Tags applied, metadata stored, customizations triggered | Step Functions `aft-account-provisioning-framework` | ~4 min |
+| Global then account customizations applied | CodePipeline `<account-id>-customizations-pipeline` | ~2 min |
+
+The Step Functions framework only starts after Control Tower reports the account as created, so it doesn't appear until Service Catalog finishes.
+
+Per-account customization pipelines don't run on a push to the customization repos (`DetectChanges = false`). To re-apply a customization change to existing accounts, either **Release change** on `<account-id>-customizations-pipeline`, or start Step Functions `aft-invoke-customizations` with `{"include":[{"type":"all"}]}`.
+
+### 10. Tagging convention
+
+Every resource and account carries the same keys:
+
+| Key | Value |
+|---|---|
+| `Project` | `meridian-payments-ltd` |
+| `ManagedBy` | `Terraform` for `aws-control` (applied by hand); `AFT` for anything AFT applies |
+| `Path` | The repo and folder that owns it, e.g. `aws-control/live/management`, `aft-global-customizations/terraform` |
+| `Environment` | Per root module or per vended account (e.g. `management`, `aft`, `sandbox`) |
+
+Tags are defined once in each root module's `locals.tf` as `local.tags`. In the AFT repos, `aft-providers.jinja` applies them to every resource through `default_tags { tags = local.tags }`, replacing AFT's default `managed_by = "AFT"` tag. Vended accounts get `local.tags` plus their `Environment` as Organizations tags.
+
+Search by `Path` in **Resource Groups → Tag Editor** to find everything a given folder created.
+
+### Next
+
+- [ ] Account quota increase: the org is at 5 of 5 accounts (us-east-1 → Service Quotas → AWS Organizations → Maximum number of accounts)
+- [ ] Vend the remaining accounts: network, shared-service, payment-prod, analytics-prod, payment-dev, analytics-dev, scp-test
 
 ## Teardown
 
