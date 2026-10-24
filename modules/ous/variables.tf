@@ -24,6 +24,12 @@ variable "identity_center_enabled_baseline_arn" {
   type        = string
 }
 
+variable "controls" {
+  description = "Optional Control Tower controls to enable on this OU: short name => control ARN"
+  type        = map(string)
+  default     = {}
+}
+
 variable "tags" {
   description = "Tags applied to the OU and its baseline"
   type        = map(string)
